@@ -7,6 +7,7 @@ for semantic search over Zotero libraries.
 
 import json
 import os
+import gc
 from pathlib import Path
 from typing import Any
 import logging
@@ -243,36 +244,118 @@ class GeminiEmbeddingFunction(EmbeddingFunction):
 class HuggingFaceEmbeddingFunction(EmbeddingFunction):
     """Custom HuggingFace embedding function for ChromaDB using sentence-transformers."""
 
-    def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B"):
+    def __init__(
+        self,
+        model_name: str = "Qwen/Qwen3-Embedding-0.6B",
+        device: str | None = None,
+        batch_size: int | None = None,
+        torch_dtype: str | None = None,
+    ):
         self.model_name = model_name
+        self.device = self._resolve_device(device)
+        self.batch_size = batch_size
+        self.torch_dtype = torch_dtype
 
         try:
             from sentence_transformers import SentenceTransformer
             logger.info(f"Loading embedding model: {model_name}")
-            self.model = SentenceTransformer(model_name, trust_remote_code=True)
+            kwargs: dict[str, Any] = {"trust_remote_code": True}
+            if self.device:
+                kwargs["device"] = self.device
+            if self.torch_dtype:
+                kwargs["model_kwargs"] = {
+                    "dtype": self._resolve_torch_dtype(self.torch_dtype)
+                }
+            self.model = SentenceTransformer(model_name, **kwargs)
         except ImportError:
             raise ImportError("sentence-transformers package is required for HuggingFace embeddings. Install with: pip install sentence-transformers")
 
         # Read limit from model metadata; conservative fallback
         self.max_input_tokens = getattr(self.model, "max_seq_length", 500)
 
+    def _resolve_device(self, device: str | None) -> str | None:
+        """Resolve optional device config while preserving default behavior."""
+        if not device:
+            return None
+
+        normalized = str(device).strip().lower()
+        if normalized == "auto":
+            try:
+                import torch
+                return "cuda" if torch.cuda.is_available() else "cpu"
+            except ImportError:
+                return "cpu"
+
+        return normalized
+
+    def _resolve_torch_dtype(self, torch_dtype: str) -> Any:
+        """Resolve configured torch dtype for HuggingFace model loading."""
+        normalized = str(torch_dtype).strip().lower()
+        try:
+            import torch
+        except ImportError as e:
+            raise ImportError("torch is required when embedding_config.torch_dtype is set") from e
+
+        dtype_map = {
+            "auto": "auto",
+            "float16": torch.float16,
+            "fp16": torch.float16,
+            "half": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+            "float32": torch.float32,
+            "fp32": torch.float32,
+        }
+        if normalized not in dtype_map:
+            raise ValueError(
+                "Unsupported embedding_config.torch_dtype "
+                f"'{torch_dtype}'. Use auto, float16, bfloat16, or float32."
+            )
+        return dtype_map[normalized]
+
+    def _cleanup_device_cache(self) -> None:
+        """Release cached CUDA/ROCm memory after embedding calls."""
+        if not self.device or not self.device.startswith("cuda"):
+            return
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            logger.debug("Unable to clear CUDA cache after embedding", exc_info=True)
+
     @staticmethod
     def name() -> str:
         return "huggingface"
 
     def get_config(self) -> dict[str, Any]:
-        return {"model_name": self.model_name}
+        return {
+            "model_name": self.model_name,
+            "device": self.device,
+            "batch_size": self.batch_size,
+            "torch_dtype": self.torch_dtype,
+        }
 
     @staticmethod
     def build_from_config(config: dict[str, Any]) -> "HuggingFaceEmbeddingFunction":
         return HuggingFaceEmbeddingFunction(
             model_name=config.get("model_name", "Qwen/Qwen3-Embedding-0.6B"),
+            device=config.get("device"),
+            batch_size=config.get("batch_size"),
+            torch_dtype=config.get("torch_dtype"),
         )
 
     def __call__(self, input: Documents) -> Embeddings:
         """Generate embeddings using HuggingFace model."""
-        embeddings = self.model.encode(input, convert_to_numpy=True)
-        return embeddings.tolist()
+        encode_kwargs: dict[str, Any] = {"convert_to_numpy": True}
+        if self.batch_size:
+            encode_kwargs["batch_size"] = int(self.batch_size)
+        try:
+            embeddings = self.model.encode(input, **encode_kwargs)
+            return embeddings.tolist()
+        finally:
+            self._cleanup_device_cache()
 
     def embed_query(self, text: str) -> list[float]:
         """Embed a query string. No special handling needed for HuggingFace."""
@@ -403,15 +486,30 @@ class ChromaClient:
 
         elif self.embedding_model == "qwen":
             model_name = self.embedding_config.get("model_name", "Qwen/Qwen3-Embedding-0.6B")
-            return HuggingFaceEmbeddingFunction(model_name=model_name)
+            return HuggingFaceEmbeddingFunction(
+                model_name=model_name,
+                device=self.embedding_config.get("device"),
+                batch_size=self.embedding_config.get("batch_size"),
+                torch_dtype=self.embedding_config.get("torch_dtype"),
+            )
 
         elif self.embedding_model == "embeddinggemma":
             model_name = self.embedding_config.get("model_name", "google/embeddinggemma-300m")
-            return HuggingFaceEmbeddingFunction(model_name=model_name)
+            return HuggingFaceEmbeddingFunction(
+                model_name=model_name,
+                device=self.embedding_config.get("device"),
+                batch_size=self.embedding_config.get("batch_size"),
+                torch_dtype=self.embedding_config.get("torch_dtype"),
+            )
 
         elif self.embedding_model not in ["default", "openai", "gemini"]:
             # Treat any other value as a HuggingFace model name
-            return HuggingFaceEmbeddingFunction(model_name=self.embedding_model)
+            return HuggingFaceEmbeddingFunction(
+                model_name=self.embedding_model,
+                device=self.embedding_config.get("device"),
+                batch_size=self.embedding_config.get("batch_size"),
+                torch_dtype=self.embedding_config.get("torch_dtype"),
+            )
 
         else:
             # Use ChromaDB's default embedding function (all-MiniLM-L6-v2)
@@ -559,6 +657,13 @@ class ChromaClient:
             logger.error(f"Error deleting documents from ChromaDB: {e}")
             raise
 
+    def delete_documents_for_item_keys(self, item_keys: list[str]) -> int:
+        """Delete all Chroma documents that belong to the given Zotero items."""
+        ids_to_delete = self.get_document_ids_for_item_keys(item_keys)
+        if ids_to_delete:
+            self.delete_documents(sorted(ids_to_delete))
+        return len(ids_to_delete)
+
     def get_collection_info(self) -> dict[str, Any]:
         """Get information about the collection."""
         try:
@@ -639,6 +744,40 @@ class ChromaClient:
             return set(result.get("ids", []))
         except Exception as e:
             logger.error(f"Error listing collection ids: {e}")
+            return set()
+
+    def get_document_ids_for_item_keys(self, item_keys: list[str]) -> set[str]:
+        """Return all Chroma document ids belonging to the given Zotero items."""
+        ids: set[str] = set()
+        for item_key in item_keys:
+            if not item_key:
+                continue
+            try:
+                result = self.collection.get(where={"item_key": item_key}, include=[])
+                ids.update(result.get("ids", []))
+            except Exception:
+                pass
+            # Legacy one-document-per-item collections used the Zotero key as
+            # the Chroma id. Include it so chunked reindexing can replace old
+            # entries cleanly.
+            if self.document_exists(item_key):
+                ids.add(item_key)
+        return ids
+
+    def get_all_item_keys(self) -> set[str]:
+        """Return Zotero item keys represented in the collection."""
+        try:
+            result = self.collection.get(include=["metadatas"])
+            ids = result.get("ids", [])
+            metadatas = result.get("metadatas", []) or []
+            item_keys: set[str] = set()
+            for idx, doc_id in enumerate(ids):
+                metadata = metadatas[idx] if idx < len(metadatas) else None
+                item_key = metadata.get("item_key") if isinstance(metadata, dict) else None
+                item_keys.add(item_key or doc_id)
+            return item_keys
+        except Exception as e:
+            logger.error(f"Error listing collection item keys: {e}")
             return set()
 
 

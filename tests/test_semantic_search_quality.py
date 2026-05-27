@@ -31,15 +31,31 @@ class FakeChromaClient:
 
     def __init__(self):
         self.upserted_docs = []
+        self.upserted_metas = []
         self.upserted_ids = []
         self.embedding_max_tokens = 8000
         self._last_query_kwargs = None
+        self.deleted_item_keys = []
 
     def get_existing_ids(self, ids):
         return set()
 
+    def get_document_metadata(self, doc_id):
+        return None
+
+    def get_all_item_keys(self):
+        return set()
+
+    def get_document_ids_for_item_keys(self, item_keys):
+        return set()
+
+    def delete_documents_for_item_keys(self, item_keys):
+        self.deleted_item_keys.extend(item_keys)
+        return 0
+
     def upsert_documents(self, documents, metadatas, ids):
         self.upserted_docs.extend(documents)
+        self.upserted_metas.extend(metadatas)
         self.upserted_ids.extend(ids)
 
     def truncate_text(self, text, max_tokens=None):
@@ -112,6 +128,98 @@ class TestCombineStructuredAndFulltext:
         assert stats["processed"] == 1
         doc = search.chroma_client.upserted_docs[0]
         assert "Only fulltext content." in doc
+
+
+class TestChunkedIndexing:
+    def _make_search(self):
+        zotero = MagicMock()
+        zotero.item.side_effect = lambda key: {"key": key, "data": {"title": f"Item {key}"}}
+        with patch.object(semantic_search, "get_zotero_client", return_value=zotero):
+            search = semantic_search.ZoteroSemanticSearch(chroma_client=FakeChromaClient())
+        search.chunking_config = {
+            "enabled": True,
+            "chunk_size_tokens": 20,
+            "chunk_overlap_tokens": 5,
+            "min_chunk_tokens": 1,
+        }
+        return search
+
+    def test_chunked_indexing_uses_chunk_ids_and_parent_metadata(self):
+        search = self._make_search()
+        fulltext = " ".join(f"word{i}" for i in range(60))
+        item = _make_item("K1", title="My Title", abstract="My Abstract", fulltext=fulltext)
+
+        stats = search._process_item_batch([item], force_rebuild=True)
+
+        assert stats["processed"] == 1
+        assert len(search.chroma_client.upserted_ids) > 1
+        assert search.chroma_client.upserted_ids[0] == "K1::chunk::0000"
+        first_meta = search.chroma_client.upserted_metas[0]
+        assert first_meta["item_key"] == "K1"
+        assert first_meta["chunk_id"] == "K1::chunk::0000"
+        assert first_meta["is_chunk"] is True
+        assert first_meta["chunk_index"] == 0
+        assert first_meta["chunk_count"] == len(search.chroma_client.upserted_ids)
+
+    def test_chunked_search_enriches_from_parent_item_key(self):
+        search = self._make_search()
+        chroma_results = {
+            "ids": [["K1::chunk::0001"]],
+            "distances": [[0.2]],
+            "documents": [["middle of the article"]],
+            "metadatas": [[{
+                "item_key": "K1",
+                "chunk_id": "K1::chunk::0001",
+                "chunk_index": 1,
+                "chunk_count": 3,
+            }]],
+        }
+
+        enriched = search._enrich_search_results(chroma_results, query="test")
+
+        assert len(enriched) == 1
+        assert enriched[0]["item_key"] == "K1"
+        assert enriched[0]["result_id"] == "K1::chunk::0001"
+        assert enriched[0]["matched_text"] == "middle of the article"
+        search.zotero_client.item.assert_called_once_with("K1")
+
+
+class TestHuggingFaceRuntimeConfig:
+    def test_device_and_batch_size_are_passed_when_configured(self):
+        from zotero_mcp.chroma_client import HuggingFaceEmbeddingFunction
+
+        calls = {}
+
+        class FakeArray:
+            def tolist(self):
+                return [[0.1, 0.2]]
+
+        class FakeSentenceTransformer:
+            max_seq_length = 4096
+
+            def __init__(self, model_name, **kwargs):
+                calls["model_name"] = model_name
+                calls["kwargs"] = kwargs
+                self.tokenizer = None
+
+            def encode(self, input, **kwargs):
+                calls["encode_kwargs"] = kwargs
+                return FakeArray()
+
+        fake_module = MagicMock(SentenceTransformer=FakeSentenceTransformer)
+        with patch.dict(sys.modules, {"sentence_transformers": fake_module}):
+            ef = HuggingFaceEmbeddingFunction(
+                model_name="Qwen/Qwen3-Embedding-0.6B",
+                device="cpu",
+                batch_size=16,
+            )
+            ef(["hello"])
+
+        assert calls["model_name"] == "Qwen/Qwen3-Embedding-0.6B"
+        assert calls["kwargs"]["device"] == "cpu"
+        assert calls["kwargs"]["trust_remote_code"] is True
+        assert calls["encode_kwargs"]["batch_size"] == 16
+        assert calls["encode_kwargs"]["convert_to_numpy"] is True
 
 
 # ---------------------------------------------------------------------------

@@ -22,8 +22,39 @@ CASCADE_TIMEOUT = 60  # seconds — total budget for the entire fallback cascade
 # Pre-search background sync debounce: at most one fire-and-forget sync per
 # this many seconds, shared across all semantic_search tool invocations.
 _PRESEARCH_SYNC_MIN_INTERVAL = 60.0
+_DEFAULT_SEMANTIC_RESULT_SNIPPET_CHARS = 500
 _last_presearch_sync_ts: float = 0.0
 _presearch_sync_lock = _threading.Lock()
+
+
+def _load_semantic_result_snippet_chars(config_path: Path) -> int:
+    """Load semantic search matched-content display limit."""
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+        value = (
+            config
+            .get("semantic_search", {})
+            .get("result_snippet_chars", _DEFAULT_SEMANTIC_RESULT_SNIPPET_CHARS)
+        )
+        value = int(value)
+        return value if value > 0 else _DEFAULT_SEMANTIC_RESULT_SNIPPET_CHARS
+    except Exception:
+        return _DEFAULT_SEMANTIC_RESULT_SNIPPET_CHARS
+
+
+def _resolve_semantic_result_snippet_chars(
+    config_path: Path,
+    override: int | None = None,
+) -> int:
+    """Resolve per-call or configured semantic matched-content display limit."""
+    if override is None:
+        return _load_semantic_result_snippet_chars(config_path)
+    try:
+        value = int(override)
+        return value if value > 0 else _DEFAULT_SEMANTIC_RESULT_SNIPPET_CHARS
+    except Exception:
+        return _DEFAULT_SEMANTIC_RESULT_SNIPPET_CHARS
 
 
 def _maybe_fire_presearch_sync(search) -> None:
@@ -778,6 +809,8 @@ def advanced_search(
         "abstracts. Works across the entire active library. "
         "query: the topic or concept; natural-language phrases work well. "
         "limit: max results (default 10). "
+        "result_snippet_chars: matched-content characters per result "
+        "(default from config, fallback 500). "
         "filters: optional metadata filters as a dict (e.g. "
         "{'itemType': 'journalArticle', 'year': '2023'}); also accepts a "
         "JSON string. "
@@ -795,6 +828,7 @@ def advanced_search(
 def semantic_search(
     query: str,
     limit: int = 10,
+    result_snippet_chars: int | None = None,
     filters: dict[str, str] | str | None = None,
     *,
     ctx: Context
@@ -805,6 +839,7 @@ def semantic_search(
     Args:
         query: Search query text - can be concepts, topics, or natural language descriptions
         limit: Maximum number of results to return (default: 10)
+        result_snippet_chars: Matched-content characters shown per result
         filters: Optional metadata filters as dict or JSON string. Example: {"item_type": "note"}
         ctx: MCP context
 
@@ -852,6 +887,10 @@ def semantic_search(
 
         # Determine config path
         config_path = Path.home() / ".config" / "zotero-mcp" / "config.json"
+        snippet_chars = _resolve_semantic_result_snippet_chars(
+            config_path,
+            result_snippet_chars,
+        )
 
         # Create semantic search instance
         search = create_semantic_search(str(config_path))
@@ -884,7 +923,11 @@ def semantic_search(
                 extra = {"Similarity Score": f"{similarity_score:.3f}"}
                 matched_text = result.get("matched_text", "")
                 if matched_text:
-                    snippet = matched_text[:300] + "..." if len(matched_text) > 300 else matched_text
+                    snippet = (
+                        matched_text[:snippet_chars] + "..."
+                        if len(matched_text) > snippet_chars
+                        else matched_text
+                    )
                     extra["Matched Content"] = snippet
                 # Override key from result since it may differ from item["key"]
                 zotero_item.setdefault("key", result.get("item_key", ""))

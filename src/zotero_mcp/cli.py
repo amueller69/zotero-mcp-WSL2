@@ -141,17 +141,14 @@ def _save_zotero_db_path_to_config(config_path: Path, db_path: str) -> None:
 
 def setup_zotero_environment():
     """Setup Zotero environment for CLI commands."""
-    # Load standalone env first so global flags (e.g., ZOTERO_NO_CLAUDE) take effect
+    # Load only the standalone Zotero MCP config for runtime commands.
+    #
+    # Older versions also read Claude Desktop's config here. That made a stale
+    # GUI-client MCP entry affect normal shell commands such as `update-db`,
+    # including semantic-search provider selection. Runtime commands should use
+    # this process environment plus ~/.config/zotero-mcp/config.json only.
     standalone_env_vars = load_standalone_env_vars()
     apply_environment_variables(standalone_env_vars)
-
-    # Respect global switch to disable Claude detection
-    no_claude = str(os.environ.get("ZOTERO_NO_CLAUDE", "")).lower() in ("1", "true", "yes")
-
-    # Load and apply Claude Desktop env unless disabled
-    if not no_claude:
-        claude_env_vars = load_claude_desktop_env_vars()
-        apply_environment_variables(claude_env_vars)
 
     # Apply fallback defaults for local Zotero if no config found.
     # Only apply when no API key is configured — if an API key exists,

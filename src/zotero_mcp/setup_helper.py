@@ -16,6 +16,17 @@ import sys
 from pathlib import Path
 
 
+def _is_wsl() -> bool:
+    """Return True when running inside Windows Subsystem for Linux."""
+    try:
+        release = Path("/proc/sys/kernel/osrelease").read_text(errors="ignore").lower()
+        if "microsoft" in release or "wsl" in release:
+            return True
+    except Exception:
+        pass
+    return bool(os.environ.get("WSL_DISTRO_NAME"))
+
+
 def _obfuscate_sensitive(value: str | None, keep_chars: int = 4) -> str:
     """Obfuscate sensitive values for terminal display."""
     if not value:
@@ -86,6 +97,11 @@ def find_executable():
 
 def find_claude_config(verbose: bool = False):
     """Find Claude Desktop config file path."""
+    if _is_wsl():
+        if verbose:
+            print("WSL detected; not auto-detecting Claude Desktop config.")
+        return None
+
     config_paths = []
 
     # macOS
@@ -554,6 +570,10 @@ def main(cli_args=None):
 
     # Find Claude Desktop config unless --no-claude
     config_path = None
+    if _is_wsl() and not args.no_claude and not args.config_path:
+        print("WSL detected; using standalone config instead of Claude Desktop config.")
+        args.no_claude = True
+
     if not args.no_claude:
         config_path = args.config_path
         if not config_path:

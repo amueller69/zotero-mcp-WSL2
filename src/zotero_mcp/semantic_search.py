@@ -86,6 +86,21 @@ def _truncate_to_tokens(text: str, max_tokens: int = 8000) -> str:
     return text
 
 
+def _is_gpu_runtime_error(error: Exception) -> bool:
+    """Return True for CUDA/ROCm failures where retrying in-process is unsafe."""
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "cuda out of memory",
+            "hip out of memory",
+            "hsa exception",
+            "memoryregion::blockallocator",
+            "rocm",
+        )
+    )
+
+
 class CrossEncoderReranker:
     """Optional cross-encoder re-ranker for semantic search results."""
 
@@ -126,6 +141,7 @@ class ZoteroSemanticSearch:
 
         # Load update configuration
         self.update_config = self._load_update_config()
+        self.chunking_config = self._load_chunking_config()
 
         # Reranker (lazy-initialized on first search)
         self._reranker: CrossEncoderReranker | None = None
@@ -194,6 +210,24 @@ class ZoteroSemanticSearch:
         except Exception as e:
             logger.warning(f"Error loading include_fulltext setting: {e}")
             return True
+
+    def _load_chunking_config(self) -> dict[str, Any]:
+        """Load optional semantic chunking configuration."""
+        config: dict[str, Any] = {
+            "enabled": False,
+            "chunk_size_tokens": 2000,
+            "chunk_overlap_tokens": 300,
+            "min_chunk_tokens": 250,
+        }
+        if not self.config_path or not os.path.exists(self.config_path):
+            return config
+        try:
+            with open(self.config_path) as f:
+                file_config = json.load(f)
+                config.update(file_config.get("semantic_search", {}).get("chunking", {}))
+        except Exception as e:
+            logger.warning(f"Error loading chunking config: {e}")
+        return config
 
     def _load_last_sync_version(self) -> int:
         """Last Zotero library version fully indexed into ChromaDB.
@@ -368,6 +402,56 @@ class ZoteroSemanticSearch:
         metadata["citation_key"] = citation_key
 
         return metadata
+
+    def _chunk_text(self, text: str) -> list[str]:
+        """Split text into overlapping token chunks for semantic indexing."""
+        chunk_size = int(self.chunking_config.get("chunk_size_tokens", 2000) or 2000)
+        overlap = int(self.chunking_config.get("chunk_overlap_tokens", 300) or 0)
+        min_tokens = int(self.chunking_config.get("min_chunk_tokens", 250) or 1)
+
+        if chunk_size <= 0:
+            chunk_size = 2000
+        if overlap < 0:
+            overlap = 0
+        if overlap >= chunk_size:
+            overlap = max(0, chunk_size // 5)
+        if min_tokens <= 0:
+            min_tokens = 1
+
+        if _tokenizer is not None:
+            tokens = _tokenizer.encode(text, disallowed_special=())
+            if len(tokens) <= chunk_size:
+                return [text]
+
+            chunks: list[str] = []
+            step = chunk_size - overlap
+            for start in range(0, len(tokens), step):
+                end = min(start + chunk_size, len(tokens))
+                window = tokens[start:end]
+                if len(window) < min_tokens and chunks:
+                    break
+                chunk = _tokenizer.decode(window).strip()
+                if chunk:
+                    chunks.append(chunk)
+                if end >= len(tokens):
+                    break
+            return chunks
+
+        # Fallback when tiktoken is unavailable: chunk by words.
+        words = text.split()
+        if len(words) <= chunk_size:
+            return [text]
+        chunks = []
+        step = chunk_size - overlap
+        for start in range(0, len(words), step):
+            end = min(start + chunk_size, len(words))
+            window = words[start:end]
+            if len(window) < min_tokens and chunks:
+                break
+            chunks.append(" ".join(window))
+            if end >= len(words):
+                break
+        return chunks
 
     def should_update_database(self) -> bool:
         """Check if the database should be updated based on configuration."""
@@ -1144,14 +1228,14 @@ class ZoteroSemanticSearch:
                 )
                 # Delete collection entries that are no longer present in the library
                 try:
-                    stored_ids = self.chroma_client.get_all_ids()
-                    to_delete = [k for k in (stored_ids - current_library_keys) if k]
+                    stored_item_keys = self.chroma_client.get_all_item_keys()
+                    to_delete = [k for k in (stored_item_keys - current_library_keys) if k]
                     if to_delete:
-                        self.chroma_client.delete_documents(to_delete)
-                        stats["deleted_items"] = len(to_delete)
+                        stats["deleted_items"] = self.chroma_client.delete_documents_for_item_keys(to_delete)
                         try:
                             sys.stderr.write(
-                                f"\nDeleted {len(to_delete)} items no longer present in Zotero.\n"
+                                f"\nDeleted {stats['deleted_items']} documents for "
+                                f"{len(to_delete)} items no longer present in Zotero.\n"
                             )
                         except Exception:
                             pass
@@ -1310,6 +1394,8 @@ class ZoteroSemanticSearch:
         documents = []
         metadatas = []
         ids = []
+        chunking_enabled = bool(self.chunking_config.get("enabled", False))
+        item_keys_to_replace: set[str] = set()
 
         for item in items:
             try:
@@ -1332,12 +1418,32 @@ class ZoteroSemanticSearch:
                     stats["skipped"] += 1
                     continue
 
-                # Truncate to fit the configured embedding model's token limit
-                doc_text = self.chroma_client.truncate_text(doc_text)
-
-                documents.append(doc_text)
-                metadatas.append(metadata)
-                ids.append(item_key)
+                if chunking_enabled:
+                    chunks = self._chunk_text(doc_text)
+                    if not chunks:
+                        stats["skipped"] += 1
+                        continue
+                    item_keys_to_replace.add(item_key)
+                    chunk_count = len(chunks)
+                    for chunk_index, chunk in enumerate(chunks):
+                        chunk_id = f"{item_key}::chunk::{chunk_index:04d}"
+                        chunk_metadata = dict(metadata)
+                        chunk_metadata.update({
+                            "item_key": item_key,
+                            "chunk_id": chunk_id,
+                            "is_chunk": True,
+                            "chunk_index": chunk_index,
+                            "chunk_count": chunk_count,
+                        })
+                        documents.append(self.chroma_client.truncate_text(chunk))
+                        metadatas.append(chunk_metadata)
+                        ids.append(chunk_id)
+                else:
+                    # Truncate to fit the configured embedding model's token limit
+                    doc_text = self.chroma_client.truncate_text(doc_text)
+                    documents.append(doc_text)
+                    metadatas.append(metadata)
+                    ids.append(item_key)
 
                 stats["processed"] += 1
 
@@ -1348,17 +1454,51 @@ class ZoteroSemanticSearch:
         # Add documents to ChromaDB if any
         if documents:
             existing_ids = set()
+            stale_ids_after_upsert: set[str] = set()
             if not force_rebuild:
-                existing_ids = self.chroma_client.get_existing_ids(ids)
+                if chunking_enabled:
+                    existing_ids.update(
+                        self.chroma_client.get_all_item_keys() & item_keys_to_replace
+                    )
+                    stale_ids_after_upsert = self.chroma_client.get_document_ids_for_item_keys(
+                        sorted(item_keys_to_replace)
+                    ) - set(ids)
+                else:
+                    existing_ids = self.chroma_client.get_existing_ids(ids)
 
             try:
                 self.chroma_client.upsert_documents(documents, metadatas, ids)
-                for doc_id in ids:
-                    if doc_id in existing_ids:
-                        stats["updated"] += 1
-                    else:
-                        stats["added"] += 1
+                if stale_ids_after_upsert:
+                    self.chroma_client.delete_documents(sorted(stale_ids_after_upsert))
+                if chunking_enabled:
+                    indexed_item_keys = set(item_keys_to_replace)
+                    for item_key in indexed_item_keys:
+                        if item_key in existing_ids:
+                            stats["updated"] += 1
+                        else:
+                            stats["added"] += 1
+                else:
+                    for doc_id in ids:
+                        if doc_id in existing_ids:
+                            stats["updated"] += 1
+                        else:
+                            stats["added"] += 1
             except Exception as e:
+                if _is_gpu_runtime_error(e):
+                    logger.error(
+                        "GPU embedding failure during Chroma upsert; aborting "
+                        "instead of retrying in the same process: %s",
+                        e,
+                    )
+                    try:
+                        sys.stderr.write(
+                            "\n\nGPU embedding failed during indexing. "
+                            "Aborting this run; restart with smaller chunk/batch settings.\n"
+                        )
+                        sys.stderr.flush()
+                    except Exception:
+                        pass
+                    raise
                 # Batch failed — collect failures for end-of-run retry.
                 # ChromaDB's ONNX tokenizer can fail intermittently in bursts;
                 # retrying immediately usually fails too. Collecting failures
@@ -1395,9 +1535,12 @@ class ZoteroSemanticSearch:
             # Over-fetch candidates when re-ranking is enabled
             reranker = self._get_reranker()
             fetch_limit = limit
+            chunking_enabled = bool(self.chunking_config.get("enabled", False))
             if reranker:
                 multiplier = self._reranker_config.get("candidate_multiplier", 3)
                 fetch_limit = limit * multiplier
+            if chunking_enabled:
+                fetch_limit = max(fetch_limit, limit * 5)
 
             # Perform semantic search
             results = self.chroma_client.search(
@@ -1409,13 +1552,14 @@ class ZoteroSemanticSearch:
             # Re-rank results with cross-encoder if enabled
             if reranker and results.get("documents") and results["documents"][0]:
                 documents = results["documents"][0]
-                ranked_indices = reranker.rerank(query, documents, top_k=limit)
+                rerank_top_k = fetch_limit if chunking_enabled else limit
+                ranked_indices = reranker.rerank(query, documents, top_k=rerank_top_k)
                 for key in ["ids", "distances", "documents", "metadatas"]:
                     if results.get(key) and results[key][0]:
                         results[key][0] = [results[key][0][i] for i in ranked_indices]
 
             # Enrich results with full Zotero item data
-            enriched_results = self._enrich_search_results(results, query)
+            enriched_results = self._enrich_search_results(results, query)[:limit]
 
             return {
                 "query": query,
@@ -1447,17 +1591,28 @@ class ZoteroSemanticSearch:
         distances = chroma_results.get("distances", [[]])[0]
         documents = chroma_results.get("documents", [[]])[0]
         metadatas = chroma_results.get("metadatas", [[]])[0]
+        seen_item_keys: set[str] = set()
 
-        for i, item_key in enumerate(ids):
+        for i, result_id in enumerate(ids):
             try:
+                metadata = metadatas[i] if i < len(metadatas) and isinstance(metadatas[i], dict) else {}
+                item_key = metadata.get("item_key") or result_id
+                if item_key in seen_item_keys:
+                    continue
+                seen_item_keys.add(item_key)
+
                 # Get full item data from Zotero
                 zotero_item = self.zotero_client.item(item_key)
 
                 enriched_result = {
                     "item_key": item_key,
+                    "result_id": result_id,
+                    "chunk_id": metadata.get("chunk_id", result_id),
+                    "chunk_index": metadata.get("chunk_index"),
+                    "chunk_count": metadata.get("chunk_count"),
                     "similarity_score": 1 - distances[i] if i < len(distances) else 0,
                     "matched_text": documents[i] if i < len(documents) else "",
-                    "metadata": metadatas[i] if i < len(metadatas) else {},
+                    "metadata": metadata,
                     "zotero_item": zotero_item,
                     "query": query
                 }
@@ -1465,13 +1620,22 @@ class ZoteroSemanticSearch:
                 enriched.append(enriched_result)
 
             except Exception as e:
+                metadata = metadatas[i] if i < len(metadatas) and isinstance(metadatas[i], dict) else {}
+                item_key = metadata.get("item_key") or result_id
                 logger.error(f"Error enriching result for item {item_key}: {e}")
+                if item_key in seen_item_keys:
+                    continue
+                seen_item_keys.add(item_key)
                 # Include basic result even if enrichment fails
                 enriched.append({
                     "item_key": item_key,
+                    "result_id": result_id,
+                    "chunk_id": metadata.get("chunk_id", result_id),
+                    "chunk_index": metadata.get("chunk_index"),
+                    "chunk_count": metadata.get("chunk_count"),
                     "similarity_score": 1 - distances[i] if i < len(distances) else 0,
                     "matched_text": documents[i] if i < len(documents) else "",
-                    "metadata": metadatas[i] if i < len(metadatas) else {},
+                    "metadata": metadata,
                     "query": query,
                     "error": f"Could not fetch full item data: {e}"
                 })
