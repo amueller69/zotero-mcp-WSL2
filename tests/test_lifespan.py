@@ -1,57 +1,37 @@
-"""Tests for server lifespan — verifies startup is non-blocking."""
+"""Tests for server lifespan."""
 
-import asyncio
-import threading
-from unittest.mock import patch
+import builtins
 
 import pytest
 
 from zotero_mcp._app import server_lifespan
+from zotero_mcp.tools.search import _maybe_fire_presearch_sync
 
 
 @pytest.mark.asyncio
-async def test_lifespan_yields_before_sync_update_completes():
-    """The lifespan must yield (allow request handling) while the
-    background semantic update is still running."""
-    entered = threading.Event()
-    proceed = threading.Event()
+async def test_lifespan_yields_without_semantic_startup_work(monkeypatch):
+    """Server startup must not import or initialize semantic search."""
+    original_import = builtins.__import__
 
-    def slow_update():
-        entered.set()
-        proceed.wait(timeout=5)
+    def guarded_import(name, *args, **kwargs):
+        if name == "zotero_mcp.semantic_search" or name.startswith("zotero_mcp.semantic_search."):
+            raise AssertionError("semantic search must not be imported during server startup")
+        return original_import(name, *args, **kwargs)
 
-    with patch("zotero_mcp._app._sync_semantic_update", slow_update):
-        async with server_lifespan(None) as ctx:
-            assert ctx == {}
-            # Yield to the event loop so the background task can start.
-            await asyncio.sleep(0.1)
-            assert entered.is_set(), \
-                "_sync_semantic_update was never called in the background"
-        proceed.set()
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+    async with server_lifespan(None) as ctx:
+        assert ctx == {}
 
 
-@pytest.mark.asyncio
-async def test_lifespan_yields_when_update_raises():
-    """Exceptions in the background update must not prevent the server
-    from starting."""
+def test_presearch_sync_is_disabled():
+    """Semantic search must not kick off a background update before querying."""
 
-    def exploding_update():
-        raise RuntimeError("ChromaDB exploded")
+    class SearchDouble:
+        def should_update_database(self):
+            raise AssertionError("pre-search sync should not inspect update config")
 
-    with patch("zotero_mcp._app._sync_semantic_update", exploding_update):
-        async with server_lifespan(None) as ctx:
-            assert ctx == {}
-            await asyncio.sleep(0.05)
+        def update_database(self, **kwargs):
+            raise AssertionError("pre-search sync should not update the database")
 
-
-@pytest.mark.asyncio
-async def test_lifespan_yields_when_config_missing():
-    """When no config exists, the background task completes instantly
-    and the lifespan still yields normally."""
-
-    def noop_update():
-        pass
-
-    with patch("zotero_mcp._app._sync_semantic_update", noop_update):
-        async with server_lifespan(None) as ctx:
-            assert ctx == {}
+    assert _maybe_fire_presearch_sync(SearchDouble()) is None
