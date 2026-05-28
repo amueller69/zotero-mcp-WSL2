@@ -43,6 +43,9 @@ class FakeChromaClient:
     def get_document_metadata(self, doc_id):
         return None
 
+    def get_document_metadata_for_item_key(self, item_key):
+        return self.get_document_metadata(item_key)
+
     def get_all_item_keys(self):
         return set()
 
@@ -220,6 +223,53 @@ class TestHuggingFaceRuntimeConfig:
         assert calls["kwargs"]["trust_remote_code"] is True
         assert calls["encode_kwargs"]["batch_size"] == 16
         assert calls["encode_kwargs"]["convert_to_numpy"] is True
+
+
+class TestChunkAwareMetadataLookup:
+    def test_get_document_metadata_for_item_key_uses_chunk_metadata(self):
+        from zotero_mcp.chroma_client import ChromaClient
+
+        class FakeCollection:
+            def get(self, ids=None, where=None, include=None):
+                if ids:
+                    return {"ids": [], "metadatas": []}
+                if where == {"item_key": "K1"}:
+                    return {
+                        "ids": ["K1::chunk::0000"],
+                        "metadatas": [{
+                            "item_key": "K1",
+                            "has_fulltext": True,
+                            "chunk_index": 0,
+                        }],
+                    }
+                return {"ids": [], "metadatas": []}
+
+        client = ChromaClient.__new__(ChromaClient)
+        client.collection = FakeCollection()
+
+        metadata = client.get_document_metadata_for_item_key("K1")
+
+        assert metadata["item_key"] == "K1"
+        assert metadata["has_fulltext"] is True
+
+    def test_get_document_metadata_for_item_key_preserves_legacy_id_lookup(self):
+        from zotero_mcp.chroma_client import ChromaClient
+
+        class FakeCollection:
+            def get(self, ids=None, where=None, include=None):
+                if ids == ["K1"]:
+                    return {
+                        "ids": ["K1"],
+                        "metadatas": [{"item_key": "K1", "has_fulltext": "failed"}],
+                    }
+                raise AssertionError("metadata lookup should stop after legacy hit")
+
+        client = ChromaClient.__new__(ChromaClient)
+        client.collection = FakeCollection()
+
+        metadata = client.get_document_metadata_for_item_key("K1")
+
+        assert metadata["has_fulltext"] == "failed"
 
 
 # ---------------------------------------------------------------------------

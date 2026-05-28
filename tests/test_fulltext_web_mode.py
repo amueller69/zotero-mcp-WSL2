@@ -39,8 +39,14 @@ class FakeChromaClient:
     def get_all_ids(self):
         return set(self._ids)
 
+    def get_all_item_keys(self):
+        return set(self._ids)
+
     def get_document_metadata(self, doc_id):
         return None
+
+    def get_document_metadata_for_item_key(self, item_key):
+        return self.get_document_metadata(item_key)
 
     def upsert_documents(self, documents, metadatas, ids):
         self.added.append((list(documents), list(metadatas), list(ids)))
@@ -54,6 +60,10 @@ class FakeChromaClient:
         self.deleted.extend(list(ids))
         for i in ids:
             self._ids.discard(i)
+
+    def delete_documents_for_item_keys(self, item_keys):
+        self.delete_documents(item_keys)
+        return len(item_keys)
 
     def reset_collection(self):
         self.reset_calls += 1

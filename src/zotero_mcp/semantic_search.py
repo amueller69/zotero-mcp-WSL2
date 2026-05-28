@@ -721,7 +721,7 @@ class ZoteroSemanticSearch:
 
                         # CHECK IF ITEM ALREADY EXISTS (unless force_rebuild or no client)
                         if chroma_client and not force_rebuild:
-                            existing_metadata = chroma_client.get_document_metadata(it.key)
+                            existing_metadata = chroma_client.get_document_metadata_for_item_key(it.key)
                             if existing_metadata:
                                 chroma_has_fulltext = existing_metadata.get("has_fulltext", False)
                                 local_has_fulltext = len(reader.get_fulltext_meta_for_item(it.item_id)) > 0

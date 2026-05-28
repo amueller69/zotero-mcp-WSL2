@@ -723,6 +723,44 @@ class ChromaClient:
         except Exception:
             return None
 
+    def get_document_metadata_for_item_key(self, item_key: str) -> dict[str, Any] | None:
+        """Get representative metadata for a Zotero item.
+
+        Legacy collections used the Zotero item key as the Chroma document id.
+        Chunked collections use per-chunk ids and store the Zotero key in
+        metadata["item_key"], so incremental fulltext extraction must check
+        metadata rather than only the raw id.
+        """
+        if not item_key:
+            return None
+
+        legacy_metadata = self.get_document_metadata(item_key)
+        if legacy_metadata:
+            return legacy_metadata
+
+        try:
+            result = self.collection.get(
+                where={"item_key": item_key},
+                include=["metadatas"],
+            )
+            metadatas = [
+                metadata
+                for metadata in (result.get("metadatas") or [])
+                if isinstance(metadata, dict)
+            ]
+            if not metadatas:
+                return None
+
+            for metadata in metadatas:
+                if metadata.get("has_fulltext") is True:
+                    return metadata
+            for metadata in metadatas:
+                if metadata.get("has_fulltext") == "failed":
+                    return metadata
+            return metadatas[0]
+        except Exception:
+            return None
+
     def get_existing_ids(self, ids: list[str]) -> set[str]:
         """Return the subset of ids that already exist in the collection."""
         if not ids:
