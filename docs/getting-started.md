@@ -216,6 +216,8 @@ If you encounter issues:
 
 Some functionality will not work for local libraries due to the distinct differences with [Zotero's local JS API](https://www.zotero.org/support/dev/client_coding/javascript_api). For instance, tagging and other library modifications might not work as expected with the local API connection.
 
+When `ZOTERO_LOCAL=true` is set without `ZOTERO_API_KEY` and `ZOTERO_LIBRARY_ID`, Zotero MCP treats the server as local-only and does not advertise write/mutation tools to MCP clients. This keeps incompatible tools out of client tool lists and reduces prompt context. Set `ZOTERO_MCP_HIDE_LOCAL_INCOMPATIBLE_TOOLS=false` to show every tool anyway.
+
 **Workaround**: Even without web storage, a workaround for some of these functionalities might be to set up a web library, point the MCP at that, and then things like setting tags should work properly. We're thinking about better ways to work with local instances in future updates.
 
 ### Database Issues
