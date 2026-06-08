@@ -5,13 +5,13 @@ import os
 import uuid
 from pathlib import Path
 
-from zotero_mcp._context import Context
-from zotero_mcp._app import mcp
 from zotero_mcp import client as _client
-from zotero_mcp.client import with_zotero_api_lock
 from zotero_mcp import utils as _utils
+from zotero_mcp._app import mcp
+from zotero_mcp._context import Context
+from zotero_mcp.client import with_zotero_api_lock
+from zotero_mcp.semantic_worker_client import get_semantic_worker_client
 from zotero_mcp.tools.retrieval import get_item_fulltext
-
 
 # These are required for ChatGPT custom MCP servers via web "connectors"
 # specific tools required are "search" and "fetch"
@@ -32,8 +32,8 @@ from zotero_mcp.tools.retrieval import get_item_fulltext
         "query: topic string; natural language works (embedding match). "
         "No limit parameter — fixed at 10 per the connector UI's "
         "expected result-set size. "
-        "Requires the semantic search DB populated — run "
-        "zotero_update_search_database first if empty. "
+        "Requires the semantic search DB populated; use the "
+        "`zotero-mcp update-db` CLI command if empty. "
         "SILENT FALLBACK: any error returns {\"results\":[]} rather "
         "than raising, to keep the ChatGPT connector stable. "
         "Example (agent-invoked): search(query='mindfulness-based "
@@ -53,13 +53,15 @@ def chatgpt_connector_search(
     try:
         default_limit = 10
 
-        from zotero_mcp.semantic_search import create_semantic_search
-
         config_path = Path.home() / ".config" / "zotero-mcp" / "config.json"
-        search = create_semantic_search(str(config_path))
 
         result_list: list[dict[str, str]] = []
-        results = search.search(query=query, limit=default_limit, filters=None) or {}
+        results = get_semantic_worker_client().search(
+            query=query,
+            limit=default_limit,
+            filters=None,
+            config_path=config_path,
+        ) or {}
         for r in results.get("results", []):
             item_key = r.get("item_key") or ""
             title = ""

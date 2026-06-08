@@ -544,7 +544,7 @@ def manage_collections(
         "on the Zotero cloud free-tier 300MB quota — metadata still lands "
         "even when the upload fails. "
         "Requires a writable library (web API key or hybrid mode); fails "
-        "in local-only mode. Remember to run zotero_update_search_database "
+        "in local-only mode. Use the `zotero-mcp update-db` CLI command "
         "afterwards to make the new item searchable semantically. "
         "Example: zotero_add_by_doi(doi='10.1145/3708319', "
         "collections=['9SU943GB'], tags=['MCP'])."
@@ -710,7 +710,7 @@ def add_by_doi(
                 f"Collections: {collections_status}\n"
                 f"PDF: {pdf_status}\n\n"
                 "_Note: To include this item in semantic search, run "
-                "zotero_update_search_database._"
+                "`zotero-mcp update-db`._"
             )
         return f"Failed to create item: {result}"
 
@@ -746,7 +746,7 @@ def add_by_doi(
         "resolve to a DOI and use zotero_add_by_doi instead when "
         "possible. "
         "Requires a writable library (fails in local-only mode). Run "
-        "zotero_update_search_database afterwards for semantic search. "
+        "`zotero-mcp update-db` afterwards for semantic search. "
         "Example: zotero_add_by_url(url='https://arxiv.org/abs/2602.14878', "
         "collections=['9SU943GB'])."
     )
@@ -802,7 +802,7 @@ def add_by_url(
             return (
                 f"Created webpage item for: {url}\n\nItem key: `{item_key}`\n\n"
                 "_Note: To include this item in semantic search, run "
-                "zotero_update_search_database._"
+                "`zotero-mcp update-db`._"
             )
         return f"Failed to create item: {result}"
 
@@ -930,7 +930,7 @@ def _add_by_arxiv(arxiv_id, collections, tags, write_zot, ctx, attach_mode="auto
             f"arXiv ID: {arxiv_id}\n"
             f"PDF: {pdf_status}\n\n"
             "_Note: To include this item in semantic search, run "
-            "zotero_update_search_database._"
+            "`zotero-mcp update-db`._"
         )
     return f"Failed to create arXiv item: {result}"
 
@@ -1141,8 +1141,8 @@ def add_by_isbn(
                 "_Note: Open Library and Google Books metadata can be noisy "
                 "(publisher-as-author, concatenated places, off-by-one dates). "
                 "Verify via `zotero_get_item_metadata` after creation. "
-                "Run `zotero_update_search_database` to include this item "
-                "in semantic search._"
+                "Run `zotero-mcp update-db` to include this item in "
+                "semantic search._"
             )
         return f"Failed to create item: {result}"
 
@@ -1975,8 +1975,8 @@ def get_pdf_outline(
         "tags: optional list of tag strings. "
         "Requires a writable library (fails in local-only mode). PDF "
         "uploads may hit the 300MB Zotero cloud free-tier quota — "
-        "metadata still lands. Run zotero_update_search_database "
-        "afterwards for semantic search. "
+        "metadata still lands. Run `zotero-mcp update-db` afterwards for "
+        "semantic search. "
         "Example: zotero_add_from_file(file_path='/Users/me/paper.pdf', "
         "collections=['9SU943GB'])."
     )
@@ -2114,7 +2114,7 @@ def add_from_file(
             f"{'DOI: ' + extracted_doi + chr(10) if extracted_doi else ''}"
             f"{attach_info}\n\n"
             "_Note: To include this item in semantic search, run "
-            "zotero_update_search_database._"
+            "`zotero-mcp update-db`._"
         )
 
     except Exception as e:
@@ -2519,7 +2519,7 @@ def _format_batch_result(header: str, results: list[dict]) -> str:
     lines.append("")
     lines.append(
         "_Note: To include new items in semantic search, run "
-        "zotero_update_search_database._"
+        "`zotero-mcp update-db`._"
     )
     return "\n".join(lines)
 

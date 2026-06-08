@@ -1,12 +1,11 @@
 """Tests for search improvements: normalization, variant generation, fallback cascade."""
 
-import pytest
-from unittest.mock import MagicMock, patch
-from conftest import DummyContext, FakeZotero, skip_on_ci
+from unittest.mock import MagicMock
+
+from conftest import DummyContext, skip_on_ci
 
 from zotero_mcp import utils as _utils
 from zotero_mcp.tools import search as search_module
-
 
 # ---------------------------------------------------------------------------
 # TestNormalization
@@ -448,12 +447,11 @@ class TestVerificationGuidance:
         monkeypatch.setattr(search_module, "_search_with_variants", fake_search_with_variants)
         monkeypatch.setattr(search_module._client, "get_zotero_client", lambda: fake_zot)
 
-        # Mock semantic search
-        fake_sem = MagicMock()
-        fake_sem.search.return_value = {
+        # Mock semantic worker search
+        fake_worker = MagicMock()
+        fake_worker.search.return_value = {
             "results": [{"item_key": "S1", "zotero_item": sem_items[0]}]
         }
-        fake_create = MagicMock(return_value=fake_sem)
 
         # Make config path exist
         config_dir = tmp_path / ".config" / "zotero-mcp"
@@ -461,9 +459,7 @@ class TestVerificationGuidance:
         (config_dir / "config.json").write_text("{}")
         monkeypatch.setattr(search_module.Path, "home", lambda: tmp_path)
 
-        monkeypatch.setattr(
-            "zotero_mcp.semantic_search.create_semantic_search", fake_create
-        )
+        monkeypatch.setattr(search_module, "get_semantic_worker_client", lambda: fake_worker)
 
         ctx = DummyContext()
         result = search_module.search_items(query="Nonexistent Paper 2099", ctx=ctx)

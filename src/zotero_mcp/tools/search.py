@@ -12,6 +12,7 @@ from zotero_mcp import utils as _utils
 from zotero_mcp._app import mcp
 from zotero_mcp._context import Context
 from zotero_mcp.client import with_zotero_api_lock
+from zotero_mcp.semantic_worker_client import SemanticWorkerError, get_semantic_worker_client
 from zotero_mcp.tools import _helpers
 
 _search_logger = _logging.getLogger("zotero_mcp.search")
@@ -272,15 +273,15 @@ def search_items(
                 # Strategy 4: Semantic search (if database exists)
                 if not _check_cascade_timeout() and not items:
                     try:
-                        from zotero_mcp.semantic_search import create_semantic_search
                         config_path = Path.home() / ".config" / "zotero-mcp" / "config.json"
                         if config_path.exists():
                             ctx.info(f"Retry with semantic search: '{query}'")
                             t0 = _time.monotonic()
-                            sem_search = create_semantic_search(str(config_path))
-                            _search_logger.debug(f"[CASCADE] semantic init: {_time.monotonic() - t0:.2f}s")
-                            t0 = _time.monotonic()
-                            sem_results = sem_search.search(query=query, limit=limit or 10)
+                            sem_results = get_semantic_worker_client().search(
+                                query=query,
+                                limit=limit or 10,
+                                config_path=config_path,
+                            )
                             _search_logger.debug(f"[CASCADE] semantic query: {_time.monotonic() - t0:.2f}s")
                             if sem_results and sem_results.get("results"):
                                 seen_keys: set[str] = set()
@@ -785,10 +786,9 @@ def advanced_search(
         "filters: optional metadata filters as a dict (e.g. "
         "{'itemType': 'journalArticle', 'year': '2023'}); also accepts a "
         "JSON string. "
-        "Requires the semantic search database to be POPULATED — run "
-        "zotero_update_search_database first if you just installed the "
-        "server or added new items; check readiness with "
-        "zotero_get_search_database_status. "
+        "Requires the semantic search database to be POPULATED; use the "
+        "`zotero-mcp update-db` CLI command if you just installed the "
+        "server or added new items. "
         "Available only when the [semantic] optional dependency is "
         "installed (pip install zotero-mcp-server[semantic]). "
         "Example: zotero_semantic_search(query='mindfulness-based "
@@ -846,16 +846,6 @@ def semantic_search(
 
         ctx.info(f"Performing semantic search for: '{query}'")
 
-        # Import semantic search module
-        try:
-            from zotero_mcp.semantic_search import create_semantic_search
-        except ImportError:
-            return (
-                "Semantic search is not available. Install the required packages with:\n"
-                "  pip install zotero-mcp-server[semantic]\n\n"
-                "This installs chromadb, sentence-transformers, and related dependencies."
-            )
-
         # Determine config path
         config_path = Path.home() / ".config" / "zotero-mcp" / "config.json"
         snippet_chars = _resolve_semantic_result_snippet_chars(
@@ -863,13 +853,16 @@ def semantic_search(
             result_snippet_chars,
         )
 
-        # Create semantic search instance
-        search = create_semantic_search(str(config_path))
-
-        _maybe_fire_presearch_sync(search)
-
-        # Perform search
-        results = search.search(query=query, limit=limit, filters=filters)
+        # Perform search in the disposable semantic worker process.
+        try:
+            results = get_semantic_worker_client().search(
+                query=query,
+                limit=limit,
+                filters=filters,
+                config_path=config_path,
+            )
+        except SemanticWorkerError as e:
+            return f"Semantic search error: {e}"
 
         if results.get("error"):
             return f"Semantic search error: {results['error']}"
@@ -919,23 +912,8 @@ def semantic_search(
 @mcp.tool(
     name="zotero_update_search_database",
     description=(
-        "Build or refresh the semantic search embedding database from "
-        "Zotero items. Run this: (a) after first install, (b) after adding "
-        "items via zotero_add_by_doi / add_by_url / add_from_file, or "
-        "(c) when the user has added items directly in Zotero desktop "
-        "since the last update. "
-        "By default the update is INCREMENTAL — only new or changed items "
-        "are re-embedded, so repeated calls are cheap. "
-        "force_rebuild=True re-embeds ALL items from scratch (slow; use "
-        "when changing the embedding model or recovering from corruption). "
-        "limit: optional cap on items processed (useful for smoke-testing). "
-        "Progress is reported via the MCP context; on large libraries an "
-        "incremental update is seconds, a full rebuild can take minutes. "
-        "Requires the [semantic] optional dependency and a configured "
-        "embedding provider (see config.json). Check status with "
-        "zotero_get_search_database_status. "
-        "Example: zotero_update_search_database() after adding a batch of "
-        "papers."
+        "Removed from MCP serve mode. Use the `zotero-mcp update-db` CLI "
+        "command to build or refresh the semantic search database."
     )
 )
 @with_zotero_api_lock
@@ -945,146 +923,26 @@ def update_search_database(
     *,
     ctx: Context
 ) -> str:
-    """
-    Update the semantic search database.
-
-    Args:
-        force_rebuild: Whether to rebuild the entire database from scratch
-        limit: Limit number of items to process (useful for testing)
-        ctx: MCP context
-
-    Returns:
-        Update status and statistics
-    """
-    try:
-        ctx.info("Starting semantic search database update...")
-
-        # Import semantic search module
-        try:
-            from zotero_mcp.semantic_search import create_semantic_search
-        except ImportError:
-            return (
-                "Semantic search is not available. Install the required packages with:\n"
-                "  pip install zotero-mcp-server[semantic]\n\n"
-                "This installs chromadb, sentence-transformers, and related dependencies."
-            )
-
-        # Determine config path
-        config_path = Path.home() / ".config" / "zotero-mcp" / "config.json"
-
-        # Create semantic search instance
-        search = create_semantic_search(str(config_path))
-
-        # Use fulltext extraction when in local mode (has access to PDFs)
-        stats = search.update_database(
-            force_full_rebuild=force_rebuild,
-            limit=limit,
-            extract_fulltext=_utils.is_local_mode()
-        )
-
-        # Format results
-        output = ["# Database Update Results", ""]
-
-        if stats.get("error"):
-            output.append(f"**Error:** {stats['error']}")
-        else:
-            output.append(f"**Total items:** {stats.get('total_items', 0)}")
-            output.append(f"**Processed:** {stats.get('processed_items', 0)}")
-            output.append(f"**Added:** {stats.get('added_items', 0)}")
-            output.append(f"**Updated:** {stats.get('updated_items', 0)}")
-            output.append(f"**Skipped:** {stats.get('skipped_items', 0)}")
-            output.append(f"**Errors:** {stats.get('errors', 0)}")
-            output.append(f"**Duration:** {stats.get('duration', 'Unknown')}")
-
-            if stats.get('start_time'):
-                output.append(f"**Started:** {stats['start_time']}")
-            if stats.get('end_time'):
-                output.append(f"**Completed:** {stats['end_time']}")
-
-        return "\n".join(output)
-
-    except Exception as e:
-        ctx.error(f"Error updating search database: {str(e)}")
-        return f"Error updating search database: {str(e)}"
+    """Return an inert removal notice for the old MCP database update tool."""
+    return (
+        "The MCP semantic database update tool has been intentionally removed "
+        "from serve mode. Run `zotero-mcp update-db` from the command line "
+        "to build or refresh the semantic search database."
+    )
 
 
 @mcp.tool(
     name="zotero_get_search_database_status",
     description=(
-        "Report the semantic search database's readiness and stats: item "
-        "count, last update time, embedding provider / model, and whether "
-        "the [semantic] optional dependency is installed. "
-        "Use this to decide whether zotero_semantic_search will return "
-        "useful results, or whether the user should run "
-        "zotero_update_search_database first. "
-        "Takes no parameters; no side effects. "
-        "Returns a human-readable status block. If the [semantic] extras "
-        "are not installed, returns an install hint instead of stats. "
-        "Example: zotero_get_search_database_status() → count, last sync, "
-        "provider summary."
+        "Removed from MCP serve mode. Use the `zotero-mcp db-status` CLI "
+        "command to inspect the semantic search database."
     )
 )
 @with_zotero_api_lock
 def get_search_database_status(*, ctx: Context) -> str:
-    """
-    Get semantic search database status.
-
-    Args:
-        ctx: MCP context
-
-    Returns:
-        Database status information
-    """
-    try:
-        ctx.info("Getting semantic search database status...")
-
-        # Import semantic search module
-        try:
-            from zotero_mcp.semantic_search import create_semantic_search
-        except ImportError:
-            return (
-                "Semantic search is not available. Install the required packages with:\n"
-                "  pip install zotero-mcp-server[semantic]\n\n"
-                "This installs chromadb, sentence-transformers, and related dependencies."
-            )
-
-        # Determine config path
-        config_path = Path.home() / ".config" / "zotero-mcp" / "config.json"
-
-        # Create semantic search instance
-        search = create_semantic_search(str(config_path))
-
-        # Get status
-        status = search.get_database_status()
-
-        # Format results
-        output = ["# Semantic Search Database Status", ""]
-
-        collection_info = status.get("collection_info", {})
-        output.append("## Collection Information")
-        output.append(f"**Name:** {collection_info.get('name', 'Unknown')}")
-        output.append(f"**Document Count:** {collection_info.get('count', 0)}")
-        output.append(f"**Embedding Model:** {collection_info.get('embedding_model', 'Unknown')}")
-        output.append(f"**Database Path:** {collection_info.get('persist_directory', 'Unknown')}")
-
-        if collection_info.get('error'):
-            output.append(f"**Error:** {collection_info['error']}")
-
-        output.append("")
-
-        update_config = status.get("update_config", {})
-        output.append("## Update Configuration")
-        output.append(f"**Auto Update:** {update_config.get('auto_update', False)}")
-        output.append(f"**Frequency:** {update_config.get('update_frequency', 'manual')}")
-        output.append(f"**Last Update:** {update_config.get('last_update', 'Never')}")
-        output.append(f"**Should Update Now:** {status.get('should_update', False)}")
-
-        frequency = update_config.get('update_frequency', 'manual')
-        if frequency.startswith('every_') and update_config.get('update_days'):
-            output.append(f"**Update Interval:** Every {update_config['update_days']} days")
-
-        return "\n".join(output)
-
-    except Exception as e:
-        ctx.error(f"Error getting database status: {str(e)}")
-        return f"Error getting database status: {str(e)}"
+    """Return an inert removal notice for the old MCP database status tool."""
+    return (
+        "The MCP semantic database status tool has been intentionally removed "
+        "from serve mode. Run `zotero-mcp db-status` from the command line "
+        "to inspect the semantic search database."
+    )

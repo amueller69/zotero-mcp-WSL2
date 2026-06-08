@@ -59,6 +59,15 @@ LOCAL_ONLY_INCOMPATIBLE_TOOLS = frozenset(
     }
 )
 
+DISABLED_MCP_TOOLS = frozenset(
+    {
+        "fetch",
+        "search",
+        "zotero_get_search_database_status",
+        "zotero_update_search_database",
+    }
+)
+
 _FALSEY_ENV_VALUES = {"0", "false", "no", "off"}
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
@@ -86,6 +95,8 @@ def should_register_tool(tool_name: str | None) -> bool:
     """
     if not tool_name:
         return True
+    if tool_name in DISABLED_MCP_TOOLS:
+        return False
     if not _hide_local_incompatible_tools_enabled():
         return True
     if not _is_local_only_mode():
